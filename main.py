@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""pumpfun-top5-forecast-01 entry: momentum-shrunk mean-reversion forecast.
+"""pumpfun-top5-forecast-01 entry v1e: momentum-shrunk mean-reversion forecast
+with a market-drift correction.
 
 Reads /input/history.ndjson (10-min snapshots of new pump.fun coins) and
 /input/task.json, writes /output/forecast.json with:
@@ -9,7 +10,16 @@ Reads /input/history.ndjson (10-min snapshots of new pump.fun coins) and
     more at longer horizons in the practice data).
   - top5: the 5 coins with the highest predicted future log-cap.
   - sizes: per-place log10 market-cap bin distributions (mixture of an
-    incumbent normal and a newcomer normal), widened with horizon.
+    incumbent normal and a wider newcomer normal around the SAME centre:
+    a newcomer holding place k has place k's cap, not #1's).
+
+v1e changes over v1: the top-5 cap level drifts up fast in the practice
+data (#1 rose 3.04 -> 3.56 log10 SOL in 40 minutes, and the level was
+still rising ~+0.1 per 10 minutes at the cut), so the forecast adds a
+market-drift term estimated from the slope of the top-5 level over the
+last three marks, capped and saturating over long horizons. The size
+spread is tightened (the dev leaders' size scores imply a tighter,
+better-centred distribution than v1's).
 
 Horizon H (hours from history cut to the mean answer read) is read from
 task.json, so the same code adapts to the 1h practice and the 10h final:
@@ -41,11 +51,14 @@ NEWCOMER_PER_H = 0.03    # extra unnamed share per horizon hour
 NEWCOMER_MAX = 0.68      # cap on unnamed share
 TAU_BASE = 0.20          # Gaussian kernel width (log10) at H=0
 TAU_PER_H = 0.02         # extra kernel width per horizon hour
-SIZE_SD_BASE = 0.35      # incumbent size sd (log10) at H=0
+SIZE_SD_BASE = 0.30      # incumbent size sd (log10) at H=0
 SIZE_SD_PER_H = 0.06     # extra size sd per horizon hour
 SIZE_SD_MAX = 0.90       # cap on incumbent size sd
-NEW_SIZE_SD = 0.55       # newcomer size sd (log10)
+NEW_SIZE_SD = 0.45       # newcomer size sd (log10)
 NEW_SIZE_BONUS = 0.15    # newcomers reaching top-5 run above the top incumbent
+DRIFT_TAU_H = 1.5        # market drift saturates over ~1.5h of horizon
+DRIFT_MIN = -0.30        # cap market drift at -0.30 log10/hour
+DRIFT_MAX = 0.70         # cap market drift at +0.70 log10/hour
 MAX_NAMED_PER_PLACE = 60  # cap on rows per place (limit is 100)
 MICRO = 1_000_000        # probabilities rounded down to 6 decimals
 
@@ -77,6 +90,10 @@ def main():
     cut = parse_ts(task["history_until"])
     horizon_h = max(0.0, (sum(reads) / len(reads) - cut) / 3600.0)
 
+    # ---- market drift: slope of the top-5 cap level over the last marks ----
+    # (filled after marks are parsed; see below)
+    drift_total = 0.0
+
     # ---- parse marks; per-coin series of (t, logcap, venue) ----
     marks = []
     with open(os.path.join(INPUT_DIR, "history.ndjson")) as f:
@@ -90,6 +107,18 @@ def main():
     if not marks:
         raise SystemExit("the history holds no ok mark with rows")
     marks.sort(key=lambda m: parse_ts(m["at"]))
+    _lt, _lv = [], []
+    for _m in marks[-3:]:
+        _rows = sorted(_m["rows"], key=lambda r: r["rank"])[:places]
+        _lt.append(parse_ts(_m["at"]))
+        _lv.append(sum(log_cap_sol(r["market_cap_lamports"]) for r in _rows) / len(_rows))
+    if len(_lt) >= 2:
+        _mt = sum(_lt) / len(_lt); _mv = sum(_lv) / len(_lv)
+        _num = sum((t - _mt) * (v - _mv) for t, v in zip(_lt, _lv))
+        _den = sum((t - _mt) ** 2 for t in _lt)
+        _drift = _num / _den * 3600.0 if _den > 0 else 0.0
+        _drift = max(DRIFT_MIN, min(DRIFT_MAX, _drift))
+        drift_total = _drift * DRIFT_TAU_H * (1.0 - math.exp(-horizon_h / DRIFT_TAU_H)) if horizon_h > 0 else 0.0
     last = marks[-1]
     last_t = parse_ts(last["at"])
     last_rows = sorted(last["rows"], key=lambda r: r["rank"])
@@ -140,7 +169,7 @@ def main():
         if venue == "pool":
             decay = DECAY_POOL_TOP if rank0 < 20 else DECAY_POOL
 
-        mu = x_now + MOM_SHRINK * mom * mom_factor - decay * horizon_h
+        mu = x_now + drift_total + MOM_SHRINK * mom * mom_factor - decay * horizon_h
 
         # fresh graduates pump: coins that reached the pool within the last
         # hour get a small boost (practice top coins were all fresh graduates).
@@ -171,9 +200,6 @@ def main():
     while len(mu_top) < places:
         mu_top.append(mu_top[-1] if mu_top else 2.0)
 
-    # newcomer size centre: a newcomer reaching the top 5 runs at/above #1
-    mu_new = max(mu_top[0] + NEW_SIZE_BONUS, 3.6)
-
     # ---- probabilities: Gaussian kernel around each place's predicted cap ----
     named_mass = 1.0 - newcomer
     probabilities = []
@@ -198,6 +224,9 @@ def main():
     top5 = [p[0] for p in preds[:places]]
 
     # ---- sizes: mixture of incumbent + newcomer normals per place ----
+    # newcomer centre per place: a newcomer holding place k has place k's
+    # cap, not #1's (the old #1-centred mixture miscentred places 2-5
+    # badly). Same centre as incumbents, wider spread.
     sizes = []
     nbins = len(edges) + 1  # bins 0..len(edges)
     for k in range(1, places + 1):
@@ -206,7 +235,7 @@ def main():
             lo = -math.inf if b == 0 else edges[b - 1]
             hi = math.inf if b == len(edges) else edges[b]
             p_inc = norm_cdf(hi, mu_inc, size_sd) - norm_cdf(lo, mu_inc, size_sd)
-            p_new = norm_cdf(hi, mu_new, NEW_SIZE_SD) - norm_cdf(lo, mu_new, NEW_SIZE_SD)
+            p_new = norm_cdf(hi, mu_inc, NEW_SIZE_SD) - norm_cdf(lo, mu_inc, NEW_SIZE_SD)
             p = (1.0 - newcomer) * p_inc + newcomer * p_new
             u = math.floor(p * MICRO)
             if u > 0:
@@ -217,7 +246,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(out_path, "w") as f:
         f.write(json.dumps(forecast) + "\n")
-    print(f"wrote {out_path}: horizon={horizon_h:.2f}h newcomer={newcomer:.2f} "
+    print(f"wrote {out_path}: horizon={horizon_h:.2f}h drift_total={drift_total:.2f} newcomer={newcomer:.2f} "
           f"tau={tau:.2f} size_sd={size_sd:.2f} probs={len(probabilities)} "
           f"sizes={len(sizes)} top5={[p[0][:8] for p in preds[:places]]}",
           file=sys.stderr)
